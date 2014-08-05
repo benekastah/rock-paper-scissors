@@ -1,11 +1,9 @@
 # pylint: disable=missing-docstring
 # Chat program
+from collections import OrderedDict, defaultdict
 import select
 import socket
-from collections import OrderedDict, defaultdict
-
-HOST = '0.0.0.0'
-PORT = 1338
+import sys
 
 
 class Move(object):
@@ -258,11 +256,12 @@ class Player(object):
         return self.name
 
 
-def main():
+def main(host, port):
     """Start a rock-paper-scissors server"""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
+    print 'Binding to {0}:{1}'.format(host, port)
+    server.bind((host, int(port)))
     server.listen(1)
     lobby = Lobby()
     read_list = [server]
@@ -322,4 +321,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main(*sys.argv[1:])
