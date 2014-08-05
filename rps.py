@@ -1,5 +1,4 @@
 # pylint: disable=missing-docstring
-# Chat program
 from collections import OrderedDict, defaultdict
 import select
 import socket
