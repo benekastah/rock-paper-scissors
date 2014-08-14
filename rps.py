@@ -1,7 +1,9 @@
 # pylint: disable=missing-docstring
 from collections import OrderedDict, defaultdict
+import argparse
 import select
 import socket
+import string
 import sys
 
 
@@ -42,6 +44,68 @@ class Style(object):
         start = Style.encode(*attrs)
         end = Style.encode(Style.RESET)
         return ''.join([start, str(text), end])
+
+
+class Commander(object):
+    def __init__(self, onerr=None):
+        self.parser = argparse.ArgumentParser()
+        self.commands_parser = self.parser.add_subparsers()
+        self.onerr = onerr
+        self.commands = {}
+
+    def make_command(self, name, action):
+        parser = self.commands_parser.add_parser(name)
+        parser.add_argument('--ACTION', dest='action', action='store_const',
+                            const=action, default=action)
+        self.commands[name] = parser
+        return parser
+
+    def format_help(self):
+        return self.parser.format_help()
+
+    def parse(self, command):
+        args = []
+        arg = []
+        string_tokens = ('"', '"')
+        state = None
+
+        def take_arg(arg):
+            if arg:
+                args.append(''.join(arg))
+                return []
+            return arg
+
+        for ch in command:
+            if state is None:
+                if ch in string.whitespace and arg:
+                    arg = take_arg(arg)
+                elif ch in string_tokens:
+                    state = ch
+                else:
+                    arg.append(ch)
+            elif state in string_tokens:
+                if ch == state:
+                    arg = take_arg(arg)
+                    state = None
+                else:
+                    arg.append(ch)
+        arg = take_arg(arg)
+        err = None
+        parsed = None
+        try:
+            parsed = self.parser.parse_args(args)
+        except SystemExit as e:
+            err = e
+        except Exception as e:
+            err = e
+        return err, parsed
+
+    def run(self, command, **kwargs):
+        (err, parsed) = self.parse(command)
+        if err and self.onerr:
+            return self.onerr('Invalid command: {}'.format(command), **kwargs)
+        elif parsed:
+            return parsed.action(parsed, **kwargs)
 
 
 class Move(object):
@@ -102,9 +166,21 @@ class Game(object):
         self.players.add(player)
         return True
 
+    def remove_player(self, player):
+        if self.moves:
+            self.end_game()
+        else:
+            players = list(self.players)
+            self.players.remove(player)
+            for p in players:
+                p.prompt()
+
     def other_player(self, player):
         diff = self.players - {player}
-        (result,) = diff
+        if diff:
+            (result,) = diff
+        else:
+            result = None
         return result
 
     def try_run(self):
@@ -163,6 +239,9 @@ class Game(object):
             self.moves[player] = PAPER()
         elif move_upper in ('S', 'SCISSORS'):
             self.moves[player] = SCISSORS()
+        elif move_upper == 'EXIT':
+            self.remove_player(player)
+            return
         else:
             player.prompt(''.join([
                 'Invalid move: "{}"'.format(move),
@@ -239,16 +318,6 @@ class Lobby(object):
     def get_game(self, name):
         return self.games.get(name)
 
-    def help(self):
-        return '\n'.join([
-            'Commands:',
-            '    ?: show this text',
-            '    c <name>: create new game with <name>',
-            '    j <name>: join existing game with <name>',
-            '    l: list games',
-            '    who: list players',
-        ])
-
 
 class Player(object):
     def __init__(self, sock, lobby):
@@ -256,6 +325,23 @@ class Player(object):
         self.lobby = lobby
         self.name = None
         self.game = None
+        self.reset_notifications_messages()
+
+    def reset_notifications_messages(self):
+        self.messages = []
+        self.notifications = []
+
+    def notify(self, message):
+        self.notifications.append(message)
+
+    def message(self, message):
+        self.messages.append(message)
+
+    def send_notifications_messages(self):
+        message = '\n'.join(self.notifications + self.messages)
+        if message:
+            self.prompt(message)
+        self.reset_notifications_messages()
 
     def prompt(self, txt=''):
         if txt and not txt.endswith('\n'):
@@ -300,6 +386,11 @@ class Player(object):
             if not self.game.try_run():
                 self.send('Waiting for other player...')
 
+    def exit_game(self):
+        if self.game:
+            self.game = None
+            game.remove_player(self)
+
     def play(self, move):
         self.game.play(self, move)
 
@@ -310,94 +401,130 @@ class Player(object):
         return Style.wrap(self.name, [Style.FG_BLUE])
 
 
-def main(host, port):
-    """Start a rock-paper-scissors server"""
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    print 'Binding to {0}:{1}'.format(host, port)
-    server.bind((host, int(port)))
-    server.listen(1)
-    lobby = Lobby()
-    read_list = [server]
-    write_list = []
-    notifications = []
+class Server(object):
+    argparser = None
 
-    def disconnect(sock):
-        read_list.remove(sock)
-        write_list.remove(sock)
+    def __init__(self, host, port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        print 'Binding to {0}:{1}'.format(host, port)
+        self.socket.bind((host, int(port)))
+        self.socket.listen(1)
+        self.read_list = [self]
+        self.write_list = []
+        self.lobby = Lobby()
 
-    while True:
-        readable, writable, _ = select.select(read_list, write_list, [])
+        self.commander = Commander(onerr=self.commander_err)
+        self.commander.make_command('?', self.show_help)
+        self.commander.make_command('list', self.list_games)
+        self.commander.make_command('who', self.list_players)
+        create_cmd = self.commander.make_command('create', self.create_game)
+        create_cmd.add_argument('name', action='store')
+        join_cmd = self.commander.make_command('join', self.join_game)
+        join_cmd.add_argument('name', action='store')
 
-        notify = '\n'.join(notifications)
-        notifications = []
-        if notify:
+    def commander_err(self, err, player):
+        player.notifications.append(err)
+        self.show_help(None, player)
+
+    def show_help(self, _, player):
+        player.notifications.append(self.commander.format_help())
+
+    def list_games(self, _, player):
+        player.notify(self.lobby.list_games())
+
+    def list_players(self, _, player):
+        players = []
+        for p in self.read_list:
+            if isinstance(p, Player):
+                player_text = ['    ', str(p)]
+                if p.game:
+                    player_text.append(' in ')
+                    player_text.append(Style.wrap(
+                        p.game.name, [Style.FG_GREEN]))
+                players.append(''.join(player_text))
+        player.prompt('\n'.join(players))
+
+    def create_game(self, args, player):
+        name = args.name
+        game = player.create_game(name)
+        self.notify(
+            '{0} created game {1}'.format(
+                player, Style.wrap(game.name, [Style.FG_GREEN])),
+            author=player)
+
+    def join_game(self, args, player):
+        name = args.name
+        player.join_game(name)
+        self.notify(
+            '{0} joined game {1}'.format(
+                player, Style.wrap(name, [Style.FG_GREEN])),
+            author=player)
+
+    def notify(self, message, author=None):
+        for player in self.write_list:
+            if player is not author:
+                player.notifications.append(message)
+
+    def chat(self, message, from_, to=None):
+        if to:
+            to.messages.append('{0} to you: {1}'.format(from_, message))
+        else:
+            for player in self.write_list:
+                if player is not from_:
+                    player.messages.append('{0}: {1}'.format(from_, message))
+
+    def serve(self):
+        while True:
+            readable, writable, _ = select.select(
+                self.read_list, self.write_list, [])
             for sock in writable:
                 if isinstance(sock, Player):
-                    sock.send(notify)
-                    sock.prompt()
-
-        for sock in readable:
-            if sock is server:
-                new_client, _ = server.accept()
-                player = Player(new_client, lobby)
-                read_list.append(player)
-                write_list.append(player)
-                player.prompt_name()
-            elif isinstance(sock, Player):
-                player = sock
-                if notify:
-                    player.send(notify)
-                data = player.socket.recv(1024)
-                if not data:
-                    disconnect(player)
-                    continue
-                else:
-                    data = data.strip()
-
-                if player.game:
-                    player.play(data)
-                else:
-                    if not player.name:
-                        if data:
-                            player.name = data
-                            player.prompt(Style.wrap(
-                                'Welcome to Rock Paper Scissors! Type "?" '
-                                'for help',
-                                [Style.FG_MAGENTA]))
-                        else:
-                            player.prompt_name()
+                    sock.send_notifications_messages()
+            for sock in readable:
+                if sock is self:
+                    new_client, _ = self.socket.accept()
+                    player = Player(new_client, self.lobby)
+                    self.connect(player)
+                    player.prompt_name()
+                elif isinstance(sock, Player):
+                    player = sock
+                    data = player.socket.recv(1024)
+                    if not data:
+                        self.disconnect(player)
                         continue
-
-                    if data == '?':
-                        player.prompt(lobby.help())
-                    elif data == 'l':
-                        player.prompt(lobby.list_games())
-                    elif data == 'who':
-                        players = []
-                        for p in read_list:
-                            if isinstance(p, Player):
-                                player_text = ['    ', str(p)]
-                                if p.game:
-                                    player_text.append(' in ')
-                                    player_text.append(Style.wrap(
-                                        p.game.name, [Style.FG_GREEN]))
-                                players.append(''.join(player_text))
-                        player.prompt('\n'.join(players))
-                    elif data.startswith('c '):
-                        name = data[2:]
-                        game = player.create_game(name)
-                        notifications.append('{0} created game {1}'.format(
-                            player, Style.wrap(game.name, [Style.FG_GREEN])))
-                    elif data.startswith('j '):
-                        name = data[2:]
-                        player.join_game(name)
-                        notifications.append('{0} joined game {1}'.format(
-                            player, Style.wrap(name, [Style.FG_GREEN])))
                     else:
-                        player.prompt('Unrecognized command: {}'.format(data))
-            else:
-                disconnect(sock)
+                        data = data.strip()
+                    if not player.name:
+                        player.name = data
+                        player.prompt(Style.wrap(
+                            'Welcome to Rock Paper Scissors! Type "?" '
+                            'for help',
+                            [Style.FG_MAGENTA]))
+                        continue
+                    if player.game:
+                        player.play(data)
+                    else:
+                        self.commander.run(data, player=player)
+
+    def connect(self, client):
+        self.read_list.append(client)
+        self.write_list.append(client)
+
+    def disconnect(self, client):
+        self.read_list.remove(client)
+        self.write_list.remove(client)
+        if isinstance(client, Player):
+            pass
+
+    def fileno(self):
+        return self.socket.fileno()
+
+
+def main(host, port):
+    """Start a rock-paper-scissors server"""
+    server = Server(host, port)
+    server.serve()
 
 
 if __name__ == '__main__':
