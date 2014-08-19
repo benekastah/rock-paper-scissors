@@ -325,23 +325,16 @@ class Player(object):
         self.lobby = lobby
         self.name = None
         self.game = None
-        self.reset_notifications_messages()
-
-    def reset_notifications_messages(self):
-        self.messages = []
         self.notifications = []
 
     def notify(self, message):
         self.notifications.append(message)
 
-    def message(self, message):
-        self.messages.append(message)
-
-    def send_notifications_messages(self):
-        message = '\n'.join(self.notifications + self.messages)
+    def send_notifications(self):
+        message = '\n'.join(self.notifications)
         if message:
             self.prompt(message)
-        self.reset_notifications_messages()
+        self.notifications = []
 
     def prompt(self, txt=''):
         if txt and not txt.endswith('\n'):
@@ -422,6 +415,11 @@ class Server(object):
         create_cmd.add_argument('name', action='store')
         join_cmd = self.commander.make_command('join', self.join_game)
         join_cmd.add_argument('name', action='store')
+        chat_cmd = self.commander.make_command('msg', self.chat)
+        chat_cmd.add_argument('to', action='store')
+        chat_cmd.add_argument('msg', action='store', nargs='+')
+        chat_all_cmd = self.commander.make_command('msg-all', self.chat)
+        chat_all_cmd.add_argument('msg', action='store', nargs='+')
 
     def commander_err(self, err, player):
         player.notifications.append(err)
@@ -464,15 +462,14 @@ class Server(object):
     def notify(self, message, author=None):
         for player in self.write_list:
             if player is not author:
-                player.notifications.append(message)
+                player.notify(message)
 
-    def chat(self, message, from_, to=None):
-        if to:
-            to.messages.append('{0} to you: {1}'.format(from_, message))
-        else:
-            for player in self.write_list:
-                if player is not from_:
-                    player.messages.append('{0}: {1}'.format(from_, message))
+    def chat(self, args, player):
+        from_ = player
+        for player in self.write_list:
+            if (args.to and player.name == args.to) or \
+                    (not args.to and player is not from_):
+                player.notify('{0}: {1}'.format(from_, ' '.join(args.msg)))
 
     def serve(self):
         while True:
@@ -480,7 +477,7 @@ class Server(object):
                 self.read_list, self.write_list, [])
             for sock in writable:
                 if isinstance(sock, Player):
-                    sock.send_notifications_messages()
+                    sock.send_notifications()
             for sock in readable:
                 if sock is self:
                     new_client, _ = self.socket.accept()
