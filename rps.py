@@ -1,5 +1,6 @@
 # pylint: disable=missing-docstring
 from collections import OrderedDict, defaultdict
+from functools import partial
 import argparse
 import select
 import socket
@@ -148,13 +149,29 @@ class SCISSORS(Move):
 class Game(object):
     winning_score = 3
 
-    def __init__(self, name, lobby):
+    def __init__(self, name, server):
         self.name = name
-        self.lobby = lobby
+        self.server = server
+        self.lobby = server.lobby
         self.winner = None
         self.players = set()
         self.moves = {}
         self.reset_score()
+        self.commander = Commander(onerr=self.server.commander_err)
+        self.commander.make_command('rock', self.play_rock)
+        self.commander.make_command('r', self.play_rock)
+        self.commander.make_command('paper', self.play_paper)
+        self.commander.make_command('p', self.play_paper)
+        self.commander.make_command('scissors', self.play_scissors)
+        self.commander.make_command('s', self.play_scissors)
+        self.commander.make_command(
+            '?', partial(self.server.show_help, self.commander))
+        chat_cmd = self.commander.make_command('/', self.chat)
+        chat_cmd.add_argument('msg', action='store', nargs='+')
+
+    def chat(self, args, player):
+        to = self.other_player(player)
+        to.notify('{0}: {1}'.format(player, ' '.join(args.msg)))
 
     def reset_score(self):
         self.score = defaultdict(lambda: 0)
@@ -220,46 +237,47 @@ class Game(object):
         return '\n'.join('{0}: {1}'.format(p, self.score[p])
                          for p in self.players)
 
-    def play(self, player, move):
-        other = self.other_player(player)
+    def set_move(self, player, move):
         if player not in self.players:
             player.send('You aren\'t a player in this game')
-            return
+            return False
 
         if self.gameover:
             player.send('Player {} already won'.format(self.winner))
+            return False
 
         if not self.full:
             player.send('Wait until the game is full before playing...')
+            return False
 
-        move_upper = move.upper()
-        if move_upper in ('R', 'ROCK'):
-            self.moves[player] = ROCK()
-        elif move_upper in ('P', 'PAPER'):
-            self.moves[player] = PAPER()
-        elif move_upper in ('S', 'SCISSORS'):
-            self.moves[player] = SCISSORS()
-        elif move_upper == 'EXIT':
-            self.remove_player(player)
-            return
-        else:
-            player.prompt(''.join([
-                'Invalid move: "{}"'.format(move),
-                ' Choose one of: (R)OCK, (P)APER or (S)CISSORS'
-            ]))
-            return
+        self.moves[player] = move
+        if not self.play():
+            player.send('Waiting for other player to play...')
+        return True
 
+    def play_rock(self, _, player):
+        self.set_move(player, ROCK())
+
+    def play_paper(self, _, player):
+        self.set_move(player, PAPER())
+
+    def play_scissors(self, _, player):
+        self.set_move(player, SCISSORS())
+
+    def play(self):
         if len(self.moves) == 2:
             self.sendall('\n')
             _players = list(self.players)
             for p1, p2 in zip(_players, reversed(_players)):
                 p1.send('{0} threw {1}'.format(p2, self.moves[p2]))
 
+            p1, p2 = _players
+
             winner = None
-            if self.moves[player] > self.moves[other]:
-                winner = player
-            elif self.moves[other] > self.moves[player]:
-                winner = other
+            if self.moves[p1] > self.moves[p2]:
+                winner = p1
+            elif self.moves[p2] > self.moves[p1]:
+                winner = p2
             if winner is not None:
                 self.score[winner] += 1
                 if self.score[winner] >= self.winning_score:
@@ -281,8 +299,9 @@ class Game(object):
                 self.end_game()
             else:
                 self.prompt_move()
+            return True
         else:
-            player.send('Waiting for other player to play...')
+            return False
 
     def __repr__(self):
         s = [Style.wrap(self.name, [Style.FG_GREEN])]
@@ -299,13 +318,14 @@ class Game(object):
 
 
 class Lobby(object):
-    def __init__(self):
+    def __init__(self, server):
+        self.server = server
         self.games = OrderedDict()
 
     def new_game(self, name):
         if name in self.games:
             return 'Name "{}" taken'.format(name)
-        game = Game(name, lobby=self)
+        game = Game(name, server=self.server)
         self.games[name] = game
         return game
 
@@ -384,9 +404,6 @@ class Player(object):
             self.game = None
             game.remove_player(self)
 
-    def play(self, move):
-        self.game.play(self, move)
-
     def fileno(self):
         return self.socket.fileno()
 
@@ -405,28 +422,29 @@ class Server(object):
         self.socket.listen(1)
         self.read_list = [self]
         self.write_list = []
-        self.lobby = Lobby()
+        self.lobby = Lobby(server=self)
 
         self.commander = Commander(onerr=self.commander_err)
-        self.commander.make_command('?', self.show_help)
+        self.commander.make_command('?', partial(self.show_help, self.commander))
         self.commander.make_command('list', self.list_games)
         self.commander.make_command('who', self.list_players)
         create_cmd = self.commander.make_command('create', self.create_game)
         create_cmd.add_argument('name', action='store')
         join_cmd = self.commander.make_command('join', self.join_game)
         join_cmd.add_argument('name', action='store')
-        chat_cmd = self.commander.make_command('msg', self.chat)
+        chat_cmd = self.commander.make_command('/', self.chat)
         chat_cmd.add_argument('to', action='store')
         chat_cmd.add_argument('msg', action='store', nargs='+')
-        chat_all_cmd = self.commander.make_command('msg-all', self.chat)
+        chat_all_cmd = self.commander.make_command('/!', self.chat)
         chat_all_cmd.add_argument('msg', action='store', nargs='+')
 
     def commander_err(self, err, player):
         player.notifications.append(err)
-        self.show_help(None, player)
+        self.show_help(self.commander, None, player)
 
-    def show_help(self, _, player):
-        player.notifications.append(self.commander.format_help())
+    @staticmethod
+    def show_help(commander, _, player):
+        player.notifications.append(commander.format_help())
 
     def list_games(self, _, player):
         player.notify(self.lobby.list_games())
@@ -467,8 +485,8 @@ class Server(object):
     def chat(self, args, player):
         from_ = player
         for player in self.write_list:
-            if (args.to and player.name == args.to) or \
-                    (not args.to and player is not from_):
+            if (hasattr(args, 'to') and player.name == args.to) or \
+                    (not hasattr(args, 'to') and player is not from_):
                 player.notify('{0}: {1}'.format(from_, ' '.join(args.msg)))
 
     def serve(self):
@@ -500,7 +518,7 @@ class Server(object):
                             [Style.FG_MAGENTA]))
                         continue
                     if player.game:
-                        player.play(data)
+                        player.game.commander.run(data, player=player)
                     else:
                         self.commander.run(data, player=player)
 
